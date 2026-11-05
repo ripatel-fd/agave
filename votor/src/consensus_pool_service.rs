@@ -28,6 +28,7 @@ use {
         certificate::Certificate,
         consensus_message::{Block, BlockId, VoteMessage},
         migration::MigrationStatus,
+        unverified_vote_message::UnverifiedCertificate,
         vote::Vote,
     },
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select_biased},
@@ -613,8 +614,24 @@ impl ConsensusPoolService {
                 .take(ADDITIONAL_MESSAGES_PER_RECEIVE as usize),
         ) {
             footer_certs_received = footer_certs_received.saturating_add(1);
-            let pool_msg = PoolMessage::Certificates(certs.to_vec());
             let root_bank = ctx.sharable_banks.root();
+            // The replay bank may have a different epoch-stake snapshot from the root.
+            let certs = certs
+                .into_iter()
+                .filter_map(|cert| {
+                    let cert = UnverifiedCertificate {
+                        cert_type: cert.cert_type,
+                        signature: cert.signature,
+                        bitmap: cert.bitmap,
+                        shred_version: ctx.cluster_info.my_shred_version(),
+                    };
+                    root_bank
+                        .verify_certificate(cert, None)
+                        .inspect_err(|err| debug!("Discarding footer certificate: {err}"))
+                        .ok()
+                })
+                .collect();
+            let pool_msg = PoolMessage::Certificates(certs);
             let (new_finalized_slot, mut new_certs_to_send) = Self::add_pool_msg(
                 &root_bank,
                 &ctx.cluster_info.id(),
@@ -733,11 +750,13 @@ mod tests {
             vote::Vote,
             wire::get_vote_payload_to_sign,
         },
+        bitvec::vec::BitVec,
         crossbeam_channel::{bounded, unbounded},
         smallvec::smallvec,
         solana_bls_signatures::{
-            BLS_SIGNATURE_AFFINE_SIZE, keypair::Keypair as BLSKeypair,
-            signature::Signature as BLSSignature,
+            BLS_SIGNATURE_AFFINE_SIZE,
+            keypair::Keypair as BLSKeypair,
+            signature::{Signature as BLSSignature, SignatureProjective},
         },
         solana_epoch_schedule::EpochSchedule,
         solana_keypair::Keypair,
@@ -745,9 +764,12 @@ mod tests {
         solana_runtime::{
             bank::SlotLeader,
             bank_forks::BankForks,
+            epoch_stakes::VersionedEpochStakes,
             genesis_utils::{ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts},
         },
-        std::sync::Arc,
+        solana_signer_store::encode_base2,
+        std::{collections::HashMap, sync::Arc},
+        test_case::test_case,
     };
 
     pub struct TestContext {
@@ -1169,6 +1191,128 @@ mod tests {
             assert_eq!(ctx.ctx.consensus_message_receiver.len(), 1);
             assert_eq!(stats.certs_received.0, MAX_MESSAGES_PER_RECEIVE + 1);
             assert_eq!(stats.consensus_message_batch_receive_limit_reached.0, 1);
+        }
+    }
+
+    fn footer_certificate(
+        ctx: &TestContext,
+        cert_type: CertificateType,
+        ranks: &[usize],
+    ) -> Certificate {
+        let mut cert = UnverifiedCertificate {
+            cert_type,
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            bitmap: vec![],
+            shred_version: ctx.ctx.cluster_info.my_shred_version(),
+        };
+        let payload = cert.get_vote_payload().0;
+        let mut bitmap = BitVec::<u8>::repeat(false, ranks.iter().max().unwrap() + 1);
+        let mut signature = SignatureProjective::identity();
+        for &rank in ranks {
+            bitmap.set(rank, true);
+            let keypair = BLSKeypair::derive_from_signer(
+                &ctx.validator_keypairs[rank].vote_keypair,
+                BLS_KEYPAIR_DERIVE_SEED,
+            )
+            .unwrap();
+            signature
+                .aggregate_with(std::iter::once(&keypair.sign(&payload)))
+                .unwrap();
+        }
+        cert.signature = signature.into();
+        cert.bitmap = encode_base2(&bitmap).unwrap();
+        Certificate {
+            cert_type,
+            signature: cert.signature,
+            bitmap: cert.bitmap,
+        }
+    }
+
+    #[test_case(true, 1; "fast")]
+    #[test_case(false, 1; "slow")]
+    #[test_case(true, 2; "fast_missing_epoch")]
+    #[test_case(false, 2; "slow_missing_epoch")]
+    fn test_receive_footer_certs_rechecks_root_stakes(fast: bool, epoch: u64) {
+        let mut ctx = TestContext::default();
+        let root = ctx.ctx.sharable_banks.root();
+        assert_eq!(root.epoch_stakes(epoch).is_some(), epoch == 1);
+        let block = Block {
+            slot: root.epoch_schedule().get_first_slot_in_epoch(epoch),
+            block_id: BlockId::new_unique(),
+        };
+        let epoch_stakes = root.epoch_stakes(1).unwrap();
+        let vote_pubkey = epoch_stakes
+            .bls_pubkey_to_rank_map()
+            .get_pubkey_stake_entry(0)
+            .unwrap()
+            .vote_account_pubkey;
+        let account = epoch_stakes.stakes().vote_accounts().as_ref()[&vote_pubkey].clone();
+        let mut carrier = Bank::new_from_parent(root.clone(), SlotLeader::default(), 1);
+        carrier.set_epoch_stakes_for_test(
+            epoch,
+            VersionedEpochStakes::new_for_tests(HashMap::from([(vote_pubkey, account)]), epoch),
+        );
+        let cert_types = if fast {
+            vec![CertificateType::FinalizeFast(block)]
+        } else {
+            vec![
+                CertificateType::Finalize(block.slot),
+                CertificateType::Notarize(block),
+            ]
+        };
+        let mut stats = ConsensusPoolServiceStats::new();
+        let mut events = vec![];
+        let mut standstill_timer = Instant::now();
+
+        for ranks in [vec![0], (0..ctx.validator_keypairs.len()).collect()] {
+            let certs: SmallVec<[Certificate; 2]> = cert_types
+                .iter()
+                .map(|&cert_type| footer_certificate(&ctx, cert_type, &ranks))
+                .collect();
+            let quorum = ranks.len() > 1;
+            let accepted = quorum && root.epoch_stakes(epoch).is_some();
+            for cert in &certs {
+                let unverified = UnverifiedCertificate {
+                    cert_type: cert.cert_type,
+                    signature: cert.signature,
+                    bitmap: cert.bitmap.clone(),
+                    shred_version: ctx.ctx.cluster_info.my_shred_version(),
+                };
+                if !quorum {
+                    // Valid under the carrier's one-validator map, not the root's map.
+                    assert!(carrier.verify_certificate(unverified.clone(), None).is_ok());
+                }
+                assert_eq!(root.verify_certificate(unverified, None).is_ok(), accepted);
+            }
+            ctx.footer_certs_sender.send(certs).unwrap();
+            let msg = ctx.ctx.footer_certs_receiver.recv();
+            ConsensusPoolService::receive_footer_certs(
+                &mut ctx.ctx,
+                &mut ctx.consensus_pool,
+                &mut events,
+                &mut standstill_timer,
+                &mut stats,
+                msg,
+            )
+            .unwrap();
+            assert_eq!(
+                ctx.consensus_pool.highest_finalized_slot().is_some(),
+                accepted
+            );
+            assert_eq!(
+                ctx.ctx.highest_finalized.read().unwrap().is_some(),
+                accepted
+            );
+            assert_eq!(
+                events.iter().any(|event| matches!(event,
+                    VotorEvent::Finalized(finalized, is_fast) if *finalized == block && *is_fast == fast
+                )),
+                accepted,
+            );
+            if !accepted {
+                assert!(events.is_empty());
+                assert!(ctx.bls_receiver.is_empty());
+            }
         }
     }
 
